@@ -1,0 +1,15 @@
+[package]
+name = "iitg-connect"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.189"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
