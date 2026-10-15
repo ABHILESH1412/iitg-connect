@@ -1,5 +1,6 @@
 //! iitg-connect: keeps you logged in to the IIT Guwahati FortiGate captive portal
 //! (https://agnigarh.iitg.ac.in:1442) from a tiny background process — no browser needed.
+//! Runs on Linux, macOS and Windows; the OS-specific bits live in `os/`.
 //!
 //! One binary, dispatched on the name it is invoked as (or on its first argument):
 //!   iitg-connect   log in now and keep the session alive in the background
@@ -9,26 +10,26 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg_attr(unix, path = "os/unix.rs")]
+#[cfg_attr(windows, path = "os/windows.rs")]
+mod os;
 
 const PORTAL_URL: &str = "https://agnigarh.iitg.ac.in:1442";
 const DEFAULT_INTERVAL_MIN: u64 = 10;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 const LOG_MAX_BYTES: u64 = 64 * 1024;
-// Attributes identifying our item in the Secret Service keyring.
-const KEYRING_ATTRS: [&str; 2] = ["service", "iitg-connect"];
 
 type Result<T, E = String> = std::result::Result<T, E>;
 
 fn main() {
     let mut args = std::env::args();
     let argv0 = args.next().unwrap_or_default();
-    let name = argv0.rsplit('/').next().unwrap_or_default();
+    let name = Path::new(&argv0).file_stem().and_then(|n| n.to_str()).unwrap_or_default();
     let cmd = match name {
         "iitg-stop" => "stop".to_string(),
         "iitg-update" => "update".to_string(),
@@ -96,9 +97,13 @@ fn connect() -> Result<()> {
         }
         Err(LoginError::Other(e)) => {
             println!("failed ({e}).\nWill keep retrying in the background.");
+            write_state(None, &format!("login failed: {e}"));
             None
         }
     };
+    if session.is_some() {
+        write_state(session.as_deref(), "logged in");
+    }
 
     let pid = spawn_daemon(&creds, session.as_deref())?;
     println!(
@@ -166,18 +171,9 @@ fn spawn_daemon(creds: &Creds, session: Option<&str>) -> Result<u32> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(log);
-    // New session: detach from the terminal so closing it doesn't kill us.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("cannot start background process: {e}"))?;
+    let mut child = os::spawn_detached(&mut cmd).map_err(|e| format!("cannot start background process: {e}"))?;
 
-    // Credentials go over a pipe, never via argv/env (both are visible in /proc).
+    // Credentials go over a pipe, never via argv/env (both are visible to other processes).
     let mut stdin = child.stdin.take().expect("piped stdin");
     write!(stdin, "{}\n{}\n{}\n", creds.user, creds.pass, session.unwrap_or(""))
         .map_err(|e| format!("cannot hand over to background process: {e}"))?;
@@ -205,7 +201,6 @@ fn daemon() -> Result<()> {
 
     log(&format!("started (pid {}), refreshing every {} min", process::id(), every.as_secs() / 60));
     if session.is_some() {
-        write_state(session.as_deref(), "logged in");
         next += every;
     }
 
@@ -245,7 +240,7 @@ fn daemon() -> Result<()> {
             Err(LoginError::Other(e)) => {
                 failures += 1;
                 // Off campus or Wi-Fi down: back off, and don't flood the log.
-                if failures == 1 || failures % 50 == 0 {
+                if failures == 1 || failures.is_multiple_of(50) {
                     log(&format!("login failed ({e}), retrying (attempt {failures})"));
                 }
                 write_state(session.as_deref(), &format!("login failed: {e}"));
@@ -265,6 +260,15 @@ fn portal() -> String {
     PORTAL_URL.to_string()
 }
 
+/// Debug builds only: keep every file in this directory and skip the keyring (for tests).
+fn test_dir() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("IITG_TEST_DIR") {
+        return Some(dir.into());
+    }
+    None
+}
+
 fn interval() -> Duration {
     let min = std::env::var("IITG_INTERVAL")
         .ok()
@@ -274,21 +278,13 @@ fn interval() -> Duration {
     Duration::from_secs(min * 60)
 }
 
-fn running_pid() -> Option<i32> {
-    let pid: i32 = fs::read_to_string(pid_file()).ok()?.trim().parse().ok()?;
-    // Make sure the pid is still ours and wasn't recycled by another process.
-    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    cmdline.split(|&b| b == 0).any(|a| a == b"__daemon").then_some(pid)
+fn running_pid() -> Option<u32> {
+    let pid: u32 = fs::read_to_string(pid_file()).ok()?.trim().parse().ok()?;
+    os::is_daemon(pid).then_some(pid)
 }
 
-fn kill_and_wait(pid: i32) {
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    for _ in 0..50 {
-        if fs::metadata(format!("/proc/{pid}")).is_err() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+fn kill_and_wait(pid: u32) {
+    os::terminate(pid);
 }
 
 // ---------------------------------------------------------------- portal client
@@ -433,51 +429,31 @@ impl Creds {
     }
 }
 
-/// Keyring (GNOME Keyring / KWallet via Secret Service) first, then the fallback file.
+/// The OS keyring (GNOME Keyring/KWallet, macOS Keychain, Windows Credential Manager)
+/// first, then the fallback file.
 fn load_creds() -> Option<Creds> {
-    let from_keyring = Command::new("secret-tool")
-        .arg("lookup")
-        .args(KEYRING_ATTRS)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| Creds::parse(&String::from_utf8_lossy(&o.stdout)));
-    from_keyring.or_else(|| Creds::parse(&fs::read_to_string(creds_file()).ok()?))
+    let from_keyring = if test_dir().is_none() { os::keyring_load() } else { None };
+    from_keyring
+        .and_then(|blob| Creds::parse(&blob))
+        .or_else(|| Creds::parse(&fs::read_to_string(creds_file()).ok()?))
 }
 
 /// Returns a human description of where the credentials were stored.
 fn save_creds(creds: &Creds) -> Result<String> {
     let blob = format!("{}\n{}", creds.user, creds.pass);
 
-    let stored_in_keyring = Command::new("secret-tool")
-        .args(["store", "--label=IITG internet login (iitg-connect)"])
-        .args(KEYRING_ATTRS)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .and_then(|mut child| {
-            child.stdin.take().expect("piped stdin").write_all(blob.as_bytes())?;
-            child.wait()
-        })
-        .is_ok_and(|s| s.success());
-    if stored_in_keyring {
+    if test_dir().is_none() && os::keyring_store(&blob) {
         let _ = fs::remove_file(creds_file());
-        return Ok("the system keyring".into());
+        return Ok(os::KEYRING.into());
     }
 
-    // No Secret Service available: a file only you can read (mode 0600).
+    // No keyring available: a file only you can read.
     let path = creds_file();
     if let Some(dir) = path.parent() {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| e.to_string())?;
+        os::create_private_dir(dir).map_err(|e| e.to_string())?;
     }
     let _ = fs::remove_file(&path);
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    os::private_file(OpenOptions::new().write(true).create_new(true))
         .open(&path)
         .and_then(|mut f| f.write_all(blob.as_bytes()))
         .map_err(|e| format!("cannot save credentials: {e}"))?;
@@ -502,41 +478,16 @@ fn prompt_creds() -> Result<Creds> {
 fn read_password(prompt: &str) -> io::Result<String> {
     print!("{prompt}");
     io::stdout().flush()?;
-
-    let mut term: libc::termios = unsafe { std::mem::zeroed() };
-    let is_tty = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } == 0;
-    if is_tty {
-        let mut silent = term;
-        silent.c_lflag &= !libc::ECHO;
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &silent) };
-    }
     let mut line = String::new();
-    let res = io::stdin().lock().read_line(&mut line);
-    if is_tty {
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) };
-        println!();
-    }
-    res?;
+    os::without_echo(|| io::stdin().lock().read_line(&mut line))?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
 // ---------------------------------------------------------------- files
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/tmp".into())
-}
-
-fn xdg(var: &str, fallback: &str) -> PathBuf {
-    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| home().join(fallback))
-}
-
-/// Per-user tmpfs dir for the pid and session files (cleared on reboot, never hits disk).
 fn runtime_dir() -> PathBuf {
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) => PathBuf::from(d).join("iitg-connect"),
-        None => PathBuf::from(format!("/tmp/iitg-connect-{}", unsafe { libc::getuid() })),
-    };
-    let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+    let dir = test_dir().unwrap_or_else(os::runtime_dir);
+    let _ = os::create_private_dir(&dir);
     dir
 }
 
@@ -549,11 +500,11 @@ fn state_file() -> PathBuf {
 }
 
 fn creds_file() -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("iitg-connect/credentials")
+    test_dir().unwrap_or_else(os::config_dir).join("credentials")
 }
 
 fn log_file() -> PathBuf {
-    xdg("XDG_STATE_HOME", ".local/state").join("iitg-connect/iitg-connect.log")
+    test_dir().unwrap_or_else(os::state_dir).join("iitg-connect.log")
 }
 
 struct State {
@@ -566,11 +517,7 @@ fn write_state(session: Option<&str>, message: &str) {
     let path = state_file();
     let tmp = path.with_extension("tmp");
     let data = format!("{}\n{}\n{}\n", session.unwrap_or(""), unix_now(), message);
-    let ok = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let ok = os::private_file(OpenOptions::new().write(true).create(true).truncate(true))
         .open(&tmp)
         .and_then(|mut f| f.write_all(data.as_bytes()));
     if ok.is_ok() {
@@ -610,18 +557,8 @@ fn unix_now() -> u64 {
 }
 
 fn format_time(secs: u64) -> String {
-    let t = secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&t, &mut tm) };
-    format!(
-        "{}-{:02}-{:02} {:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec
-    )
+    let [y, mo, d, h, mi, s] = os::local_time(secs);
+    format!("{y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
 #[cfg(test)]

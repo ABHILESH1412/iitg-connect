@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (unit + end-to-end against a mock portal)
+        run: cargo test
+      - name: Install script (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          BIN_DIR="$RUNNER_TEMP/bin" ./install.sh
+          "$RUNNER_TEMP/bin/iitg-status" | grep "Not running"
+      - name: Install script (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:BIN_DIR = "$env:RUNNER_TEMP\bin"
+          ./install.ps1
+          if (-not ((& "$env:RUNNER_TEMP\bin\iitg-status.cmd") -match 'Not running')) { exit 1 }

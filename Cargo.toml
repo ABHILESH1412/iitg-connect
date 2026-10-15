@@ -4,8 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libc = "0.2.189"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
 
 [profile.release]
 opt-level = "s"
